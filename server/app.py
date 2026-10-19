@@ -1,22 +1,45 @@
+import os
+from datetime import timedelta
+from dotenv import load_dotenv
 from flask import Flask, request
-from flask_migrate import Migrate
 from flask_bcrypt import Bcrypt
-from flask_jwt_extended import ( JWTManager, create_access_token, jwt_required, get_jwt_identity)
+from flask_cors import CORS
+from flask_jwt_extended import ( JWTManager, create_access_token, get_jwt_identity, jwt_required,)
+from flask_migrate import Migrate
+from sqlalchemy.exc import IntegrityError
 from models import db, User, Note
-
+load_dotenv()
 app = Flask(__name__)
-
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///productivity.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# JWT configuration
-app.config["JWT_SECRET_KEY"] = "dev-secret-key-change-before-deployment"
-
-# Initialize extensions
+app.config["JWT_SECRET_KEY"] = os.environ["JWT_SECRET_KEY"]
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(minutes=15)
 db.init_app(app)
 migrate = Migrate(app, db)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
+
+# Allow the separate frontend to call this API directly.
+# During development the React proxy (package.json) already forwards
+# requests to Flask, so this only matters if you call port 5555 directly.
+CORS(app, origins=["http://localhost:4000"])
+
+MIN_PASSWORD_LENGTH = 8
+
+
+def is_text(value):
+    """True only if value is a string."""
+    return isinstance(value, str)
+
+
+def note_to_dict(note):
+    return {
+        "id": note.id,
+        "title": note.title,
+        "content": note.content,
+        "created_at": note.created_at.isoformat(),
+        "user_id": note.user_id,
+    }
 
 
 @app.route("/")
@@ -26,11 +49,19 @@ def home():
 
 @app.route("/signup", methods=["POST"])
 def signup():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
-    username = data.get("username", "").strip()
+    username = data.get("username", "")
     password = data.get("password", "")
     password_confirmation = data.get("password_confirmation", "")
+
+    # All three fields must be text
+    if not (
+        is_text(username) and is_text(password) and is_text(password_confirmation)
+    ):
+        return {"errors": ["Username and passwords must be text."]}, 400
+
+    username = username.strip()
 
     # Check that all required fields are provided
     if not username or not password or not password_confirmation:
@@ -40,73 +71,69 @@ def signup():
             ]
         }, 400
 
-    # Check that the passwords match
-    if password != password_confirmation:
+    # Check password length
+    if len(password) < MIN_PASSWORD_LENGTH:
         return {
-            "errors": ["Passwords do not match."]
+            "errors": [
+                f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+            ]
         }, 400
 
-    # Check whether the username already exists
-    existing_user = User.query.filter_by(username=username).first()
+    # Check that the passwords match
+    if password != password_confirmation:
+        return {"errors": ["Passwords do not match."]}, 400
 
-    if existing_user:
-        return {
-            "errors": ["Username already exists."]
-        }, 409
+    # Check whether the username already exists
+    if User.query.filter_by(username=username).first():
+        return {"errors": ["Username already exists."]}, 409
 
     # Hash the password before saving it
     password_hash = bcrypt.generate_password_hash(password).decode("utf-8")
 
-    # Create a new user
-    new_user = User(
-        username=username,
-        password_hash=password_hash
-    )
+    new_user = User(username=username, password_hash=password_hash)
 
-    db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.add(new_user)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return {"errors": ["Username already exists."]}, 409
 
     # Generate a JWT token for the new user
     token = create_access_token(identity=str(new_user.id))
 
-    # Return the token and user information
     return {
         "token": token,
-        "user": {
-            "id": new_user.id,
-            "username": new_user.username
-        }
+        "user": {"id": new_user.id, "username": new_user.username},
     }, 201
+
 @app.route("/login", methods=["POST"])
 def login():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
-    username = data.get("username", "").strip()
+    username = data.get("username", "")
     password = data.get("password", "")
 
+    if not (is_text(username) and is_text(password)):
+        return {"errors": ["Username and password must be text."]}, 400
+
+    username = username.strip()
+
     if not username or not password:
-        return {
-            "errors": ["Username and password are required."]
-        }, 400
+        return {"errors": ["Username and password are required."]}, 400
 
     user = User.query.filter_by(username=username).first()
 
-    if user is None or not bcrypt.check_password_hash(
-        user.password_hash, password
-    ):
-        return {
-            "errors": ["Invalid username or password."]
-        }, 401
+    if user is None or not bcrypt.check_password_hash(user.password_hash, password):
+        return {"errors": ["Invalid username or password."]}, 401
 
     token = create_access_token(identity=str(user.id))
 
     return {
         "token": token,
-        "user": {
-            "id": user.id,
-            "username": user.username
-        }
+        "user": {"id": user.id, "username": user.username},
     }, 200
+
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def me():
@@ -117,154 +144,96 @@ def me():
     if user is None:
         return {"error": "User not found."}, 404
 
-    return {
-        "id": user.id,
-        "username": user.username
-    }, 200
+    return {"id": user.id, "username": user.username}, 200
+
 @app.route("/notes", methods=["POST"])
 @jwt_required()
 def create_note():
     user_id = int(get_jwt_identity())
 
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
 
-    title = data.get("title", "").strip()
-    content = data.get("content", "").strip()
+    title = data.get("title", "")
+    content = data.get("content", "")
+
+    if not (is_text(title) and is_text(content)):
+        return {"error": "Title and content must be text."}, 400
+
+    title = title.strip()
+    content = content.strip()
 
     if not title or not content:
-        return {
-            "error": "Title and content are required."
-        }, 400
+        return {"error": "Title and content are required."}, 400
 
-    new_note = Note(
-        title=title,
-        content=content,
-        user_id=user_id
-    )
+    new_note = Note(title=title, content=content, user_id=user_id)
 
-    # Save the note to the database
     db.session.add(new_note)
     db.session.commit()
 
-    # Return the newly created note
-    return {
-        "id": new_note.id,
-        "title": new_note.title,
-        "content": new_note.content,
-        "created_at": new_note.created_at.isoformat(),
-        "user_id": new_note.user_id
-    }, 201
+    return note_to_dict(new_note), 201
+
 @app.route("/notes", methods=["GET"])
 @jwt_required()
 def get_notes():
     # Identify the logged-in user
     user_id = int(get_jwt_identity())
-
-    # Read pagination values from the URL
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 10, type=int)
-
-    # Validate pagination values
     if page < 1 or per_page < 1:
-        return {
-            "error": "Page and per_page must be positive numbers."
-        }, 400
-
-    # Limit the number of notes returned per request
+        return {"error": "Page and per_page must be positive numbers."}, 400
     per_page = min(per_page, 100)
-
-    # Retrieve only notes belonging to the logged-in user
     pagination = (
         Note.query
         .filter_by(user_id=user_id)
         .order_by(Note.id.desc())
-        .paginate(
-            page=page,
-            per_page=per_page,
-            error_out=False
-        )
+        .paginate(page=page, per_page=per_page, error_out=False)
     )
 
-    # Convert the notes into dictionaries
-    notes = []
-
-    for note in pagination.items:
-        notes.append({
-            "id": note.id,
-            "title": note.title,
-            "content": note.content,
-            "created_at": note.created_at.isoformat(),
-            "user_id": note.user_id
-        })
-
-    # Return notes and pagination information
     return {
-        "notes": notes,
+        "notes": [note_to_dict(note) for note in pagination.items],
         "pagination": {
             "page": pagination.page,
             "per_page": pagination.per_page,
             "total_notes": pagination.total,
             "total_pages": pagination.pages,
             "has_next": pagination.has_next,
-            "has_previous": pagination.has_prev
-        }
+            "has_previous": pagination.has_prev,
+        },
     }, 200
+
 @app.route("/notes/<int:note_id>", methods=["PATCH"])
 @jwt_required()
 def update_note(note_id):
-    # Identify the logged-in user
     user_id = int(get_jwt_identity())
-
-    # Find the note belonging to this user
-    note = Note.query.filter_by(
-        id=note_id,
-        user_id=user_id
-    ).first()
-
-    # Reject the request if the note does not belong to this user
+    note = Note.query.filter_by(id=note_id, user_id=user_id).first()
     if note is None:
         return {"error": "Note not found."}, 404
 
-    # Get the information sent by the client
-    data = request.get_json()
+    data = request.get_json(silent=True)
 
     if not isinstance(data, dict) or not data:
         return {"error": "Provide at least one field to update."}, 400
 
-    # Update the title if it was provided
     if "title" in data:
-        if not isinstance(data["title"], str) or not data["title"].strip():
+        if not is_text(data["title"]) or not data["title"].strip():
             return {"error": "Title cannot be empty."}, 400
-
         note.title = data["title"].strip()
 
-    # Update the content if it was provided
     if "content" in data:
-        if not isinstance(data["content"], str) or not data["content"].strip():
+        if not is_text(data["content"]) or not data["content"].strip():
             return {"error": "Content cannot be empty."}, 400
-
         note.content = data["content"].strip()
 
-    # Save the changes
     db.session.commit()
 
-    # Return the updated note
-    return {
-        "id": note.id,
-        "title": note.title,
-        "content": note.content,
-        "created_at": note.created_at.isoformat(),
-        "user_id": note.user_id
-    }, 200
+    return note_to_dict(note), 200
+
 @app.route("/notes/<int:note_id>", methods=["DELETE"])
 @jwt_required()
 def delete_note(note_id):
     user_id = int(get_jwt_identity())
 
-    note = Note.query.filter_by(
-        id=note_id,
-        user_id=user_id
-    ).first()
+    note = Note.query.filter_by(id=note_id, user_id=user_id).first()
 
     if note is None:
         return {"error": "Note not found."}, 404
@@ -272,9 +241,7 @@ def delete_note(note_id):
     db.session.delete(note)
     db.session.commit()
 
-    return {
-        "message": "Note deleted successfully."
-    }, 200
+    return {"message": "Note deleted successfully."}, 200
 
 if __name__ == "__main__":
-    app.run(port=5555, debug=True)
+    app.run(port=5555, debug=os.environ.get("FLASK_DEBUG") == "1")
